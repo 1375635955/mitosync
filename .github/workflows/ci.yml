@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_large_s3_tests:
+        description: >-
+          Also run the >5 GiB multipart upload against the emulator. Moves 5 GiB
+          and takes a few minutes, so it is not run per-PR.
+        type: boolean
+        default: false
+
+jobs:
+  # Release-readiness checks that need no compiler. They run in seconds, so they go in their
+  # own job rather than behind the AWS SDK build below - a stale version number in the install
+  # instructions should not wait twenty minutes to be reported.
+  release-docs-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Documented versions match the declared version
+        run: scripts/check-docs-version.sh
+
+      - name: Release docs have not drifted from the release workflow
+        run: scripts/check-docs-drift.sh
+
+      # Required-package list only: this job has no vcpkg tree, so it cannot reconcile
+      # installed packages. The release workflow does that against the real dependency set.
+      - name: Third-party notices name every required dependency
+        run: scripts/check-third-party-notices.sh
+
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libssl-dev \
+            libcurl4-openssl-dev \
+            libboost-all-dev \
+            libspdlog-dev \
+            libgtest-dev \
+            zlib1g-dev
+
+      - name: Install AWS SDK
+        run: |
+          git clone --depth 1 --branch 1.11.449 --recurse-submodules https://github.com/aws/aws-sdk-cpp.git
+          cd aws-sdk-cpp
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_ONLY="s3" \
+            -DENABLE_TESTING=OFF \
+            -DAUTORUN_UNIT_TESTS=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_UNITY_BUILD=OFF \
+            -DCMAKE_CXX_FLAGS="-Wno-error"
+          cmake --build build
+          sudo cmake --install build
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCOVERAGE=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run tests
+        # ctest runs every registered target. `./build/mito_tests` alone omits
+        # most of them, including the sync suite that guards against deleting
+        # data from a partial listing. Serial: several suites share fixed
+        # temporary directories and collide under -j.
+        run: cd build && ctest --output-on-failure
+
+      # The mock and the real service disagree, and only one of them ships.
+      # Issues #98 and #99 were both green against MockS3Client and rejected on
+      # the first request by a real endpoint, so these run against MinIO.
+      - name: Start the S3 emulator
+        run: scripts/s3-emulator.sh start
+
+      - name: Run S3 integration tests
+        run: |
+          eval "$(scripts/s3-emulator.sh env)"
+          if [ "${{ inputs.run_large_s3_tests }}" = "true" ]; then
+            export MITO_TEST_S3_LARGE=1
+          fi
+          cd build && ctest --output-on-failure -L s3-integration
+
+      - name: Stop the S3 emulator
+        if: always()
+        run: scripts/s3-emulator.sh stop
+
+      - name: Report the CRC32 implementation
+        # zlib-ng picks its CRC32 at run time, so which one a build uses is a
+        # property of the machine, not of the source. Print it: the previous
+        # x86 CRC path sat compiled out and untested for its whole life
+        # (issue #18), and a log line naming "portable C" where PCLMULQDQ was
+        # expected is how that would be noticed next time.
+        run: |
+          mkdir -p /tmp/crc-a /tmp/crc-b
+          printf 'ci\n' > /tmp/crc-a/f.txt
+          cp /tmp/crc-a/f.txt /tmp/crc-b/f.txt
+          ./build/mito diff -d /tmp/crc-a/ /tmp/crc-b/ 2>&1 | grep 'CRC32 implementation'
+
+      # Captured last, so the .gcda data includes the S3 integration suite and the
+      # binary run above, not just the unit tests. The build was already configured
+      # with -DCOVERAGE=ON, so this reuses that tree rather than rebuilding: a second
+      # configure would double an already long job.
+      #
+      # filter_coverage.py is not optional. Raw lcov output includes vcpkg and system
+      # headers, which bury the project's own source under thousands of lines of
+      # dependency coverage.
+      - name: Capture coverage
+        run: |
+          sudo apt-get install -y lcov
+          lcov --capture --directory build -o coverage.raw.info \
+            --ignore-errors inconsistent,mismatch,gcov,format,unsupported,negative
+          python3 scripts/filter_coverage.py coverage.raw.info coverage.info
+          lcov --summary coverage.info
+
+      # Pinned to a commit SHA rather than a tag: this action is handed an upload
+      # token, which is the same reasoning release.yml pins its actions for.
+      #
+      # fail_ci_if_error is false on purpose. A Codecov outage should not turn this
+      # repository's CI red - the coverage number is information, not a gate.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: coverage.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

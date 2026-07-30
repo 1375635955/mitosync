@@ -1,0 +1,65 @@
+# Build and CMake files
+/build/
+/build-tsan/
+/build-cov/
+/build-asan/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.exe
+*.out
+*.log
+*.a
+*.so
+*.dll
+*.dylib
+
+# vcpkg build artifacts
+vcpkg_installed/
+vcpkg/buildtrees/
+vcpkg/packages/
+vcpkg/downloads/
+vcpkg/installed/
+
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# ImGui
+imgui.ini
+
+# Coverage
+/coverage-html/
+coverage.info
+coverage.raw.info
+coverage.test.info
+
+# Test data
+/test_data/
+
+# Worktrees
+.worktrees/
+
+# Other
+*.swp
+*.swo
+
+# Claude Code session state. Untracked tooling, not project source - and it has
+# held a full worktree copy before now, so a stray `git add -A` could commit
+# close to a gigabyte.
+.claude/
+
+# Never commit credentials
+.env
+.envrc
+credentials
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519

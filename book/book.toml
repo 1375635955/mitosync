@@ -1,0 +1,15 @@
+[book]
+title = "MitoSync"
+description = "Compare and sync local files, directories and S3 objects by hardware-accelerated CRC32."
+authors = ["Nikolaos Papanikos"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/echemythia/mitosync"
+edit-url-template = "https://github.com/echemythia/mitosync/edit/main/book/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

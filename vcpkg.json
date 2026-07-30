@@ -1,0 +1,29 @@
+{
+  "name": "mito",
+  "version-string": "0.7.0",
+  "dependencies": [
+    {
+      "name": "aws-sdk-cpp",
+      "default-features": false,
+      "features": ["s3"]
+    },
+    {
+      "name": "openssl"
+    },
+    {
+      "name": "boost-asio"
+    },
+    {
+      "name": "spdlog"
+    },
+    {
+      "name": "gtest"
+    },
+    {
+      "name": "nlohmann-json"
+    },
+    {
+      "name": "zlib-ng"
+    }
+  ]
+}

@@ -1,0 +1,405 @@
+name: release
+
+# Build `mito` for Linux and macOS on a `v*` tag and attach release assets to the GitHub
+# Release. Every platform is built NATIVELY - vcpkg compiles the AWS SDK, OpenSSL and the
+# rest from source, and cross-compiling that set is far more trouble than a second runner.
+#
+# The actual build and packaging live in scripts/package-release.sh, which is also what you
+# run by hand. CI and a local release therefore produce artifacts by identical logic, and
+# the script can be fixed without touching this file.
+#
+# Release assets:
+#
+#   mito-<v>-linux-x86_64.tar.gz     glibc 2.28 floor (RHEL 8, Debian 10, Ubuntu 18.10+)
+#   mito-<v>-linux-x86_64.install.sh installs into ~/.local without sudo
+#   mito-linux-x86_64.install.sh     stable alias for releases/latest/download
+#   mito-<v>-linux-x86_64.deb        installs /usr/bin/mito on Debian-family systems
+#   mito-<v>-linux-x86_64.rpm        installs /usr/bin/mito on RPM-family systems
+#   mito-<v>-linux-aarch64.tar.gz    same, arm64
+#   mito-<v>-linux-aarch64.install.sh same, arm64
+#   mito-linux-aarch64.install.sh    stable alias for releases/latest/download
+#   mito-<v>-linux-aarch64.deb       same, arm64
+#   mito-<v>-linux-aarch64.rpm       same, arm64
+#   mito-<v>-macos-arm64.tar.gz      macOS 12+
+#   mito-<v>-macos-arm64.install.sh  installs into ~/.local without sudo
+#   mito-macos-arm64.install.sh      stable alias for releases/latest/download
+#
+# There is deliberately no macOS Intel artifact. GitHub retired the macos-13 label, and a job
+# requesting a retired label is never scheduled rather than failing - in the v0.7.0-rc4
+# rehearsal that leg sat queued for 112 minutes while the other three finished in 11 to 14,
+# which would have stalled the release until the 180-minute timeout with nothing in the log to
+# explain it. Its replacement, macos-15-intel, is on the same path: Apple has moved on from
+# Intel and that label will be retired in turn. Rather than rediscover this, macOS ships
+# Apple Silicon only. An Intel Mac user builds from source.
+#
+# There are deliberately no fully static Linux artifacts. It was tried and it does not work:
+# aws-c-cal resolves libcrypto at startup with dlopen(NULL), which returns NULL in a static
+# musl binary, so the SDK aborts on init. Everything else in the tree builds against musl
+# cleanly, and the binary passes `--help` and every static-linkage check before dying on the
+# first real S3 call - which is why it is not merely absent but documented in
+# docs/static-linking.md. Reviving it means patching a vendored crypto dependency.
+#
+# COST. On a private repository this matrix is expensive: macOS runner minutes bill at a much
+# higher multiplier than Linux ones, and a cold vcpkg build of the AWS SDK is slow (tens of
+# minutes per platform). Public repositories get standard runners free, so the bill stops being
+# the constraint - but the wall clock does not, and arm64 Linux runners are still not offered on
+# every plan. The cache below makes repeat runs far cheaper; the first run after a dependency
+# change pays full price everywhere.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish assets for (e.g. v0.2.0)"
+        required: true
+      dry_run:
+        description: >-
+          Build, verify and render the release notes, but create no GitHub Release.
+          A -rcN tag is always a dry run whatever this is set to.
+        type: boolean
+        default: false
+
+# Least privilege by default. The one job that publishes asks for more, below.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to a full commit SHA rather than a tag. These jobs produce
+# and publish the bytes a user downloads, so anyone able to move a tag we referenced could
+# replace both a binary and the checksum published beside it. The trailing comment records
+# which release each SHA is.
+
+# One release run per tag. A re-pushed or force-moved tag supersedes the older, now-stale
+# run rather than racing it: two runs uploading assets is how one tag ends up holding
+# binaries from two different builds.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run inside manylinux_2_28, not on the runner image. The artifact
+          # links glibc dynamically, so whatever glibc builds it becomes the oldest
+          # distribution it will run on. The runner images set that floor far too high:
+          # ubuntu-22.04 gives 2.35 (nothing older than Ubuntu 22.04 or RHEL 9), and
+          # ubuntu-24.04 gives 2.38. manylinux_2_28 is built for exactly this problem -
+          # glibc 2.28 with a current GCC - and covers RHEL 8, Debian 10 and Ubuntu 18.10
+          # onwards. The runner underneath only has to be the right CPU architecture.
+          - runner: ubuntu-22.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            platform: linux-x86_64
+          - runner: ubuntu-22.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            platform: linux-aarch64
+          - runner: macos-14
+            container: ''
+            platform: macos-arm64
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }} # empty string means "on the runner itself", for macOS
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC identity the provenance attestation is signed with
+      attestations: write # record that attestation against this repository
+    steps:
+      # Resolve the tag ONCE, before anything else touches it, and refuse anything that is
+      # not a plain vMAJOR.MINOR.PATCH. The workflow_dispatch input is free text from
+      # whoever dispatched the run, and GitHub substitutes `${{ … }}` TEXTUALLY into a
+      # `run:` body before bash parses it, so an unvalidated value would execute as shell.
+      # Reading it from the environment plus the format gate closes both halves.
+      - name: Resolve and validate the release tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          # bash `[[ =~ ]]`, not `grep -E`: grep matches line by line, so `^…$` would accept
+          # a two-line value whose second line writes another variable into $GITHUB_ENV.
+          #
+          # A -rcN tag is accepted and forced to a dry run. That is what makes a rehearsal
+          # possible at all: the final tag cannot be pushed twice, so proving the workflow on
+          # the real tag would mean proving it on the release itself.
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            dry="${INPUT_DRY_RUN:-false}"
+          elif [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+            dry=true
+          else
+            echo "::error::refusing to release '$tag': expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rcN"
+            exit 1
+          fi
+          # Assets are named from the version the tree declares, which carries no -rcN. Strip
+          # it here so every later step names the same files the build produced.
+          ver="${tag#v}"; ver="${ver%-rc*}"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "REL_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "DRY_RUN=$dry" >> "$GITHUB_ENV"
+          echo "resolved $tag as version $ver (dry run: $dry)"
+
+      - name: Checkout (the tag being released, with vcpkg)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          submodules: recursive # vcpkg is a submodule; without it there is no toolchain
+
+      # The tag decides which tree is built, but nothing ties it to the version the tree
+      # declares. Tagging a tree whose version was never bumped would ship mito-0.1.0
+      # tarballs under a v0.2.0 release. package-release.sh already refuses a mismatch
+      # between CMakeLists.txt and vcpkg.json; this adds the tag to that check.
+      - name: Tag matches the declared version
+        run: |
+          want="$REL_VERSION"
+          got="$(sed -n 's/^project(mito VERSION \([0-9][0-9.]*\)).*/\1/p' CMakeLists.txt | head -1)"
+          [ -n "$got" ] || { echo "::error::could not read the version from CMakeLists.txt"; exit 1; }
+          [ "$want" = "$got" ] || {
+            echo "::error::tag $TAG does not match the project version $got — bump CMakeLists.txt and vcpkg.json, or retag"; exit 1; }
+
+      # manylinux_2_28 already carries GCC 14, git, perl, autoconf/automake/libtool and
+      # pkg-config. The tools below cover vcpkg's build, OpenSSL's configure step, checksum
+      # packaging and the Linux installer formats.
+      #
+      # The cmake it installs matters more than it looks. The image ships CMake 4.x in
+      # /usr/local/bin, which rejects the `cmake_minimum_required` values that a good many
+      # vcpkg ports still declare, so the dependency build fails port by port. dnf's cmake
+      # is 3.26 and lands in /usr/bin, which is put first on PATH for exactly that reason.
+      # perl-core and kernel-headers are for OpenSSL specifically. Its Configure script wants
+      # IPC::Cmd, Data::Dumper and FindBin, none of which are in the image's minimal perl,
+      # and its build needs the system kernel headers. Without them the vcpkg build fails at
+      # the first dependency with "Perl cannot find IPC::Cmd".
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          dnf install -y -q ninja-build zip cmake perl-core kernel-headers binutils rpm-build
+          echo "PATH=/usr/bin:$PATH" >> "$GITHUB_ENV"
+          /usr/bin/cmake --version
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja autoconf automake libtool pkg-config
+
+      # The vcpkg submodule's commit decides which port versions get built, so it belongs in
+      # the cache key. hashFiles() cannot see it (.gitmodules records the URL, not the
+      # pinned commit), so read it from the index.
+      - name: Record the vcpkg commit
+        run: echo "VCPKG_SHA=$(git rev-parse HEAD:vcpkg)" >> "$GITHUB_ENV"
+
+      # vcpkg compiles the AWS SDK, OpenSSL, Boost, spdlog and GoogleTest from source, which
+      # dominates the run. Its binary cache turns that into an unpack on any run whose
+      # dependency set is unchanged. Keyed on the manifest and that submodule commit,
+      # because either changing invalidates what was built.
+      - name: Cache vcpkg build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-${{ matrix.platform }}-${{ hashFiles('vcpkg.json') }}-${{ env.VCPKG_SHA }}
+          restore-keys: |
+            vcpkg-${{ matrix.platform }}-${{ hashFiles('vcpkg.json') }}-
+            vcpkg-${{ matrix.platform }}-
+
+      - name: Bootstrap vcpkg and install dependencies
+        run: ./bootstrap.sh
+
+      # The notice inventory is a legal statement about the artifact this job is about to
+      # produce, so reconcile it against what vcpkg actually installed rather than against a
+      # list someone maintained by hand. This is the only place that reconciliation can happen
+      # - ordinary CI builds against apt packages and has no vcpkg tree - and it runs before
+      # the build so a dependency added without a notice stops the release cheaply.
+      - name: Third-party notices cover every installed dependency
+        run: ./scripts/check-third-party-notices.sh
+
+      # The same script a human runs. It builds, runs the full test suite serially, strips
+      # (and re-signs on macOS), records what the binary needs at run time, packages, then
+      # extracts the tarball again and drives the binary out of it before declaring success.
+      - name: Build, test and package
+        run: ./scripts/package-release.sh
+
+      - name: Name the artifact for later steps
+        run: echo "ASSET_BASE=mito-$REL_VERSION-${{ matrix.platform }}" >> "$GITHUB_ENV"
+
+      # Sign a build provenance statement over the exact bytes about to be uploaded. The
+      # .sha256 is served from the same release as the tarball, so a leaked contents:write
+      # token replaces both and a checksum still verifies. The attestation is signed through
+      # Sigstore with an OIDC identity GitHub mints for THIS job, binding the bytes to this
+      # repository, this workflow file and this commit.
+      #
+      # It runs BEFORE the upload on purpose: a failed attestation must stop the release
+      # rather than leave unattested binaries published.
+      #
+      # SKIPPED WHILE THE REPOSITORY IS PRIVATE. GitHub does not offer the attestations API
+      # for user-owned private repositories; the step fails outright there rather than
+      # producing anything. The condition is on visibility, not a blanket continue-on-error,
+      # so the check becomes mandatory the moment the repository is public.
+      - name: Attest build provenance
+        if: github.event.repository.visibility == 'public' && env.DRY_RUN != 'true'
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
+
+      - name: Note the missing attestation
+        if: github.event.repository.visibility != 'public'
+        run: |
+          echo "::warning::Repository is ${{ github.event.repository.visibility }}, so no build \
+          provenance attestation was produced. This release is verifiable by checksum only."
+
+      # Hand the artifacts to the single publish job rather than creating the release here.
+      # Every matrix job creating its own release RACES: the second job finds the release
+      # not yet discoverable by tag, creates a second one, and the tag ends up with half its
+      # assets in each.
+      - name: Hand the artifacts to the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.platform }}
+          path: |
+            dist/${{ env.ASSET_BASE }}.*
+            dist/mito-${{ matrix.platform }}.install.sh
+            dist/mito-${{ matrix.platform }}.install.sh.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  # ONE job, so the release is created exactly once however many platforms built.
+  #
+  # `needs: build` alone would make every platform mandatory: a matrix `needs` is satisfied
+  # only when every leg succeeds, so the best-effort linux-aarch64 leg failing - or never
+  # being scheduled, on a plan without arm64 runners - would skip this job entirely and
+  # withhold the platforms that did build. That is the opposite of what the two-tier check
+  # below is written to do, and it made the aarch64 warning path unreachable.
+  #
+  # `!cancelled()` instead, with the artifact verification as the real gate: a missing
+  # REQUIRED platform fails there, loudly and by name, and a missing best-effort one warns.
+  publish:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve and validate the release tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            dry="${INPUT_DRY_RUN:-false}"
+          elif [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+            dry=true
+          else
+            echo "::error::refusing to publish '$tag': expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-rcN"
+            exit 1
+          fi
+          ver="${tag#v}"; ver="${ver%-rc*}"
+          # Everything this project publishes says experimental, 0.x, not for production. A
+          # GitHub Release badged "Latest" says the opposite, and it is the first thing a
+          # visitor reads. Mark every 0.x as a prerelease so the two agree.
+          case "$ver" in
+            0.*) pre=true ;;
+            *)   pre=false ;;
+          esac
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "REL_VERSION=$ver" >> "$GITHUB_ENV"
+          echo "DRY_RUN=$dry" >> "$GITHUB_ENV"
+          echo "PRERELEASE=$pre" >> "$GITHUB_ENV"
+
+      - name: Checkout (for the changelog, if there is one)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Collect every platform's artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      # check-release-artifacts.sh opens the .deb with `ar` and the .rpm with `rpm`. Neither
+      # is guaranteed by the runner image, and a missing `rpm` would quietly downgrade the
+      # package check to "the file exists" - install both so the verification below is real.
+      - name: Install package inspection tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binutils rpm
+
+      # Every published asset is checked here, in one place, before anything is created.
+      # A release that is missing a platform is better caught now than reported by whoever
+      # downloaded the gap.
+      # Two tiers, because one platform is not uniformly available.
+      #
+      # REQUIRED are the three whose runners every plan provides. If one of those is missing
+      # the release is broken and should not be published.
+      #
+      # BEST-EFFORT is linux-aarch64 alone, and for a reason that has nothing to do with the
+      # code: hosted arm64 Linux runners are not offered on every GitHub plan, so the job may
+      # never get scheduled. That should not withhold the platforms that did build - but it
+      # must be SAID, at warning level, naming exactly what is absent. A release quietly
+      # missing an architecture is worse than one that is loudly incomplete.
+      - name: Verify what will be published
+        run: |
+          ver="$REL_VERSION"
+          # This job now runs even when a build leg failed, so say so plainly rather than
+          # failing on `ls` when the download found nothing at all.
+          [ -d dist ] || {
+            echo "::error::no artifacts were downloaded; every build job must have failed"
+            exit 1; }
+          ls -l dist
+          for p in linux-x86_64 macos-arm64; do
+            scripts/check-release-artifacts.sh \
+              --dist-dir dist \
+              --version "$ver" \
+              --platform "$p" \
+              --linux-packages required
+          done
+          # Probe the exact tarball, not a glob: "any file mentioning aarch64" also matches a
+          # stray checksum or a leftover from a different version, which would then fail the
+          # required check below with a confusing message about the version being verified.
+          if [ -s "dist/mito-$ver-linux-aarch64.tar.gz" ]; then
+            scripts/check-release-artifacts.sh \
+              --dist-dir dist \
+              --version "$ver" \
+              --platform linux-aarch64 \
+              --linux-packages required
+          else
+            echo "::warning::mito-$ver-linux-aarch64.tar.gz was not built and will be missing from this release"
+          fi
+          # The checksums travelled with the artifacts; confirm they still describe them
+          # rather than trusting that an upload/download round trip changed nothing.
+          (cd dist && sha256sum -c ./*.sha256)
+
+      # Release notes come from CHANGELOG.md when there is a section for this version.
+      # There is no changelog in the tree today, so the fallback is what normally runs:
+      # a short body, with GitHub's generated commit list appended by the publish step.
+      - name: Assemble release notes
+        run: |
+          scripts/release-notes.sh "$REL_VERSION" > RELEASE_NOTES.md
+          echo "----- release notes for $REL_VERSION -----"; cat RELEASE_NOTES.md
+
+      # Everything above this point runs in a dry run: the matrix builds, the manifest and
+      # checksum verification, and the notes. Only the irreversible step is skipped, so a
+      # rehearsal exercises the same code path a release does.
+      - name: Note that this was a dry run
+        if: env.DRY_RUN == 'true'
+        run: echo "::notice::dry run for $TAG - artifacts verified and notes rendered, no release created"
+
+      - name: Publish the GitHub Release
+        if: env.DRY_RUN != 'true'
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ env.TAG }}
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ env.PRERELEASE == 'true' }}
+          generate_release_notes: true # appends the commit list under our body
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.install.sh
+            dist/*.install.sh.sha256
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/*.rpm
+            dist/*.rpm.sha256
