@@ -294,17 +294,9 @@ jobs:
             exit 1
           fi
           ver="${tag#v}"; ver="${ver%-rc*}"
-          # Everything this project publishes says experimental, 0.x, not for production. A
-          # GitHub Release badged "Latest" says the opposite, and it is the first thing a
-          # visitor reads. Mark every 0.x as a prerelease so the two agree.
-          case "$ver" in
-            0.*) pre=true ;;
-            *)   pre=false ;;
-          esac
           echo "TAG=$tag" >> "$GITHUB_ENV"
           echo "REL_VERSION=$ver" >> "$GITHUB_ENV"
           echo "DRY_RUN=$dry" >> "$GITHUB_ENV"
-          echo "PRERELEASE=$pre" >> "$GITHUB_ENV"
 
       - name: Checkout (for the changelog, if there is one)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -391,7 +383,16 @@ jobs:
         with:
           tag_name: ${{ env.TAG }}
           body_path: RELEASE_NOTES.md
-          prerelease: ${{ env.PRERELEASE == 'true' }}
+          # Deliberately NOT marked prerelease, even though this is 0.x. GitHub's
+          # /releases/latest endpoint skips prereleases entirely, so with only prereleases
+          # published it resolves to nothing and every
+          # /releases/latest/download/mito-<platform>.install.sh URL in the README, the book
+          # and install.sh returns 404. That is eight broken install commands - the whole
+          # documented install path - traded for a cosmetic badge. v0.7.0 shipped that way for
+          # a few minutes and had to be corrected in place.
+          #
+          # The experimental status is stated where people actually read it: the README's
+          # Status section, the book's introduction, and SECURITY.md.
           generate_release_notes: true # appends the commit list under our body
           fail_on_unmatched_files: true
           files: |

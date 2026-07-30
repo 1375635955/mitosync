@@ -58,13 +58,17 @@ git push origin v0.1.0
 
 Identical to the rehearsal except that the publish step runs.
 
-**Every `0.x` release is published as a prerelease.** The version is read from the tag, and
-anything starting `0.` sets `prerelease: true` on the GitHub Release. That is deliberate: the
-README, the book and `SECURITY.md` all say this is experimental and not for production, and a
-release badged "Latest" would say the opposite to anyone landing on the repository. The preflight
-asserts the publish step still sets it.
+**Releases are not marked as prereleases, including `0.x` ones.** That looks wrong and is
+deliberate. GitHub's `/releases/latest` endpoint skips prereleases, so if every release is a
+prerelease it resolves to nothing, and each
+`/releases/latest/download/mito-<platform>.install.sh` URL in the README, the book and
+`install.sh` returns 404. That is the entire documented install path, traded for a badge.
 
-Reaching `1.0.0` will flip that automatically, which is the point at which you should mean it.
+v0.7.0 was published as a prerelease and had to be corrected in place within minutes, so the
+preflight now asserts the publish step does *not* set it.
+
+The experimental status is stated where people actually read it: the README's Status section,
+the book's introduction, and `SECURITY.md`.
 
 ## Platform tiers
 

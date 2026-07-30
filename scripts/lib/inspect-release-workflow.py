@@ -111,7 +111,10 @@ def main() -> int:
             % OPTIONAL_PLATFORM,
         )
 
-    # --- 0.x must not be badged as the latest stable release -------------------
+    # --- the publish step must NOT mark releases as prereleases -----------------
+    # Inverted deliberately. Marking 0.x as a prerelease looks right and breaks the install
+    # path: /releases/latest skips prereleases, so with only prereleases published every
+    # /releases/latest/download/... URL in the docs 404s.
     publish_step = next(
         (
             step
@@ -124,10 +127,10 @@ def main() -> int:
         lines.append(("fail", "found no release-publishing step in publish"))
     else:
         check(
-            "prerelease" in (publish_step.get("with") or {}),
-            "the publish step sets prerelease, so a 0.x is not badged Latest",
-            "the publish step does not set prerelease; a 0.x release would publish as the "
-            "latest stable version, contradicting every warning in the docs",
+            "prerelease" not in (publish_step.get("with") or {}),
+            "the publish step does not mark prereleases, so /releases/latest resolves",
+            "the publish step sets prerelease; /releases/latest skips prereleases, so every "
+            "/releases/latest/download/... URL in the README, the book and install.sh will 404",
         )
 
     # --- both jobs validate the tag the same way -------------------------------
