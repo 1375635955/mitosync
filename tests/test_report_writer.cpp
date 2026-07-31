@@ -38,11 +38,16 @@ protected:
 
 // A small result: one match (always omitted from reports), one difference,
 // one only-in-A, one only-in-B, one error.
+//
+// mismatched_files is 3, not 1. The field counts every file that did not match, only-in-A and
+// only-in-B included, because `mismatched_files == 0` is the "everything matched" test behind
+// the exit status. This fixture used to set 1, modelling it as content differences alone -
+// the same misreading that made reports count those files twice.
 DirectoryComparisonResult make_result() {
     DirectoryComparisonResult r;
     r.total_files = 5;
     r.matching_files = 1;
-    r.mismatched_files = 1;
+    r.mismatched_files = 3;  // 1 content difference + 1 only-in-A + 1 only-in-B
     r.only_in_a = 1;
     r.only_in_b = 1;
     r.errors = 1;
@@ -401,4 +406,86 @@ TEST(PrintDirectoryResultTest, ZeroCategoriesAreOmitted) {
     EXPECT_NE(s.find("1 differ"), std::string::npos);
     EXPECT_EQ(s.find("only in"), std::string::npos);
     EXPECT_EQ(s.find("errors"), std::string::npos);
+}
+
+// --- the summary must account for every file exactly once --------------------
+//
+// mismatched_files counts every file that did not match, only-in-A and only-in-B included.
+// Reports print the only-in counts beside "different", so rendering the raw counter put those
+// files in the total twice: a pair with one match, one file only in A and one only in B came
+// out as "1/3 match, 2 differ, 1 only in a/, 1 only in b/", which adds to 5 out of 3.
+
+// The exact reported case: nothing differs in content, one file on each side only.
+TEST(SummaryArithmeticTest, OnlyInFilesAreNotAlsoCountedAsDifferences) {
+    DirectoryComparisonResult r;
+    r.total_files = 3;
+    r.matching_files = 1;
+    r.mismatched_files = 2;  // as the comparator counts it: both only-in files
+    r.only_in_a = 1;
+    r.only_in_b = 1;
+
+    std::ostringstream out;
+    print_directory_result(r, "a/", "b/", out);
+    const std::string s = out.str();
+
+    EXPECT_EQ(s.find("differ"), std::string::npos)
+        << "nothing differs in content, so no differ count belongs in: " << s;
+    EXPECT_NE(s.find("1 only in a/"), std::string::npos) << s;
+    EXPECT_NE(s.find("1 only in b/"), std::string::npos) << s;
+}
+
+// A content difference alongside only-in files must still be reported, and only once.
+TEST(SummaryArithmeticTest, ContentDifferencesSurviveAlongsideOnlyInFiles) {
+    DirectoryComparisonResult r;
+    r.total_files = 4;
+    r.matching_files = 1;
+    r.mismatched_files = 3;  // 1 content + 1 only-in-A + 1 only-in-B
+    r.only_in_a = 1;
+    r.only_in_b = 1;
+
+    std::ostringstream out;
+    print_directory_result(r, "a/", "b/", out);
+    const std::string s = out.str();
+
+    EXPECT_NE(s.find("1 differ"), std::string::npos) << s;
+    EXPECT_NE(s.find("1 only in a/"), std::string::npos) << s;
+    EXPECT_NE(s.find("1 only in b/"), std::string::npos) << s;
+}
+
+// The invariant a reader actually applies: the categories add up to the total.
+TEST_F(ReportFile, JsonSummaryCategoriesSumToTotalFiles) {
+    struct Case { size_t total, matching, mismatched, only_a, only_b, errors; };
+    const Case cases[] = {
+        {3, 1, 2, 1, 1, 0},   // the reported case: nothing differs in content
+        {4, 1, 3, 1, 1, 0},   // plus a content difference
+        {5, 1, 3, 1, 1, 1},   // plus an error
+        {1, 1, 0, 0, 0, 0},   // everything matches
+        {2, 0, 2, 2, 0, 0},   // only-in-A alone
+    };
+
+    int n = 0;
+    for (const auto& c : cases) {
+        DirectoryComparisonResult r;
+        r.total_files = c.total;
+        r.matching_files = c.matching;
+        r.mismatched_files = c.mismatched;
+        r.only_in_a = c.only_a;
+        r.only_in_b = c.only_b;
+        r.errors = c.errors;
+
+        const std::string file = path("sum" + std::to_string(n++) + ".json");
+        ASSERT_TRUE(write_json_results(file, r, "a/", "b/"));
+        const std::string json = slurp(file);
+
+        auto field = [&](const std::string& name) -> long {
+            const size_t at = json.find("\"" + name + "\":");
+            if (at == std::string::npos) return -1;
+            return std::stol(json.substr(json.find(':', at) + 1));
+        };
+
+        const long sum = field("matching") + field("different") +
+                         field("only_in_a/") + field("only_in_b/") + field("errors");
+        EXPECT_EQ(sum, static_cast<long>(c.total))
+            << "categories must account for every file exactly once, in:\n" << json;
+    }
 }

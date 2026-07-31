@@ -24,6 +24,23 @@ std::string format_bytes(uint64_t bytes) {
 }
 
 // Format duration as human-readable string (e.g., "7d", "12h", "30m", "45s")
+// Files that differ in content, as distinct from files present on only one side.
+//
+// DirectoryComparisonResult::mismatched_files counts every file that did not match, only-in-A
+// and only-in-B included, because `mismatched_files == 0` is the "everything matched" test
+// behind the exit status. Reports print the only-in counts beside it, so rendering the raw
+// number counts those files twice: one match, one file only in A and one only in B came out as
+// "1/3 match, 2 differ, 1 only in a/, 1 only in b/" - five files out of a total of three.
+//
+// The documentation already promises the derived figure: "summary.different counts genuine
+// mismatches" (book/src/reference/exit-codes.md). This is what makes that true.
+static size_t content_differences(const DirectoryComparisonResult& result) {
+    const size_t only_one_side = result.only_in_a + result.only_in_b;
+    return result.mismatched_files > only_one_side
+               ? result.mismatched_files - only_one_side
+               : 0;
+}
+
 std::string format_duration(std::chrono::seconds dur) {
     auto secs = dur.count();
     if (secs >= 86400 && secs % 86400 == 0) {
@@ -89,7 +106,7 @@ bool write_json_results(const std::string& filename, const DirectoryComparisonRe
     out << "  \"summary\": {\n";
     out << "    \"total_files\": " << result.total_files << ",\n";
     out << "    \"matching\": " << result.matching_files << ",\n";
-    out << "    \"different\": " << result.mismatched_files << ",\n";
+    out << "    \"different\": " << content_differences(result) << ",\n";
     out << "    \"only_in_" << source_a << "\": " << result.only_in_a << ",\n";
     out << "    \"only_in_" << source_b << "\": " << result.only_in_b << ",\n";
     out << "    \"errors\": " << result.errors << ",\n";
@@ -147,7 +164,7 @@ bool write_txt_results(const std::string& filename, const DirectoryComparisonRes
     out << "Summary:\n";
     out << "  Total files:      " << result.total_files << "\n";
     out << "  Matching:         " << result.matching_files << "\n";
-    out << "  Different:        " << result.mismatched_files << "\n";
+    out << "  Different:        " << content_differences(result) << "\n";
     out << "  Only in " << source_a << ": " << result.only_in_a << "\n";
     out << "  Only in " << source_b << ": " << result.only_in_b << "\n";
     out << "  Errors:           " << result.errors << "\n";
@@ -194,7 +211,8 @@ void print_directory_result(const DirectoryComparisonResult& result,
             << format_duration(result.total_elapsed) << ")\n";
     } else {
         out << "✗ " << result.matching_files << "/" << result.total_files << " match";
-        if (result.mismatched_files > 0) out << ", " << result.mismatched_files << " differ";
+        const size_t differing = content_differences(result);
+        if (differing > 0) out << ", " << differing << " differ";
         if (result.only_in_a > 0) out << ", " << result.only_in_a << " only in " << src_a;
         if (result.only_in_b > 0) out << ", " << result.only_in_b << " only in " << src_b;
         if (result.errors > 0) out << ", " << result.errors << " errors";
