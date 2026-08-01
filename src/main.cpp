@@ -498,26 +498,7 @@ static int run_rm_command(int argc, char* argv[]) {
     // A cancelled run still has a summary worth printing - how much it got
     // through, and which keys are unaccounted for. Suppressing it left the
     // user with only the cancellation line and no list of what remains.
-    const bool cancelled = progress.cancelled.load();
-    if (!opts.quiet && (result.error_message.empty() || cancelled)) {
-        if (!opts.force) {
-            std::cout << "Would delete " << progress.objects_found.load() << " objects";
-            if (result.bytes_freed > 0) {
-                std::cout << " (" << (result.bytes_freed / (1024.0 * 1024.0)) << " MiB)";
-            }
-            std::cout << "\nUse --force to delete\n";
-        } else {
-            std::cout << "Deleted: " << result.objects_deleted << " objects";
-            if (result.bytes_freed > 0) {
-                std::cout << " (" << std::fixed << std::setprecision(1)
-                          << (result.bytes_freed / (1024.0 * 1024.0)) << " MiB freed)";
-            }
-            if (result.objects_failed > 0) {
-                std::cout << ", " << result.objects_failed << " failed";
-            }
-            std::cout << " in " << std::fixed << std::setprecision(2)
-                      << result.elapsed_seconds << "s\n";
-
+   std::cout << "Deleted: " << result.objects_deleted << " objects";
             // "Failed" covers both "still there" and "could not confirm", so
             // name the keys rather than leaving the user to guess.
             if (!result.failed_keys.empty()) {
